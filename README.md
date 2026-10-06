@@ -90,8 +90,28 @@ them; they just become (almost always invalid) arguments to `gh`.
 There is no separate access secret: the bearer token in the `Authorization`
 header IS `GH_TOKEN` for the call. A missing or invalid token fails exactly
 the way running `gh` locally with no `GH_TOKEN` set would — at the GitHub
-API, inside `gh` itself — so this process can only do what the presented
-token could already do.
+API, inside `gh` itself.
+
+**That does NOT mean this process can only do what the presented token
+can do.** `gh` has its own escape hatches out of the GitHub-API surface —
+`gh alias set x '!<shell command>'` runs an arbitrary shell command with
+no GitHub auth involved at all (a real, documented `gh` feature, not a
+bug in it); `gh extension` downloads and runs third-party code; `gh
+config`/`gh auth` can durably change how a LATER call behaves. None of
+that is closed by shell-free argv splitting, because the first (and only)
+command that ever runs is `gh` itself — splitting the string just decides
+what `gh` is handed, not what `gh` is allowed to do with it. The first
+argument is checked against `ALLOWED_SUBCOMMANDS` in `gh-proxy.js` before
+anything executes — an allowlist of the subcommands actually needed
+(`api`, `issue`, `pr`, `repo`, `release`, `run`, `workflow`, …), not a
+denylist of the ones found dangerous so far. A subcommand this proxy
+hasn't been told is safe is refused, not permitted.
+
+Each call also gets its own scratch directory, used as both its working
+directory and its `GH_CONFIG_DIR` — so a disk-writing subcommand (`gh
+repo clone`, `gh run download`) can't collide with another in-flight
+call, and nothing one caller's `gh config` touches can leak into a later
+caller's. Removed after the call finishes either way.
 
 ## Response
 
@@ -99,6 +119,7 @@ token could already do.
 - Failure (non-zero exit or killed by signal): `500` with `{ ok: false, exit_code, signal, durationMs, stdout, stderr }`. As with the webhook above, a signal kill (our own timeout, or `gh` crashing) reports `exit_code: null` with `signal` set, distinct from a real non-zero exit.
 - Missing or invalid `Authorization`: `401`, no body.
 - Missing/empty `command`, or a `command` with an unterminated quote: `400` with `{ ok: false, error: "<reason>" }`.
+- First word of `command` is not on `ALLOWED_SUBCOMMANDS`: `403` with `{ ok: false, error: "subcommand '<name>' is not on the allowlist" }`.
 - Request body larger than 64 KiB: `413` with `{ ok: false, error: "body too large" }`.
 - Wrong method: `405` with `Allow: POST`. Wrong path (anything but `/gh`): `404`.
 
@@ -106,12 +127,19 @@ token could already do.
 `truncated: true` if either was cut; `gh`'s own output (JSON listings,
 diffs) runs larger than a typical deploy command's, so this cap is well
 above the webhook's 2000-character tails. `COMMAND_TIMEOUT_MS` defaults to
-2 minutes — override with the `GH_PROXY_TIMEOUT_MS` env var for a call
-that legitimately needs longer.
+2 minutes — override with the `GH_PROXY_TIMEOUT_MS` env var (`0` means no
+timeout, same as `execFile`'s own convention) for a call that legitimately
+needs longer.
 
 Unlike the webhook above, concurrent calls are not serialized: each
 request runs its own `gh` invocation with its own token, so there is no
 shared command for two in-flight requests to race against.
+
+What gets logged per call is the subcommand name and argument count only
+— never the full argument list or the raw command string. An allowed
+subcommand can still carry a secret as one of its own arguments (`gh
+secret set NAME --body "<value>"`), and a log line is a wider-access,
+longer-retained surface than the request itself.
 
 # Running under pm2
 
