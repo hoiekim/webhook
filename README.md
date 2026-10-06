@@ -55,21 +55,82 @@ Named constants at the top of `index.js` (`TAIL_MAX`, `BODY_MAX`,
 place. Defaults: 2000-char tails, 64 KiB body, 2 MiB child stdio buffer
 per stream, 10-minute timeout for `COMMAND`.
 
+# gh-proxy
+
+A second, independent server (`gh-proxy.js`) for a narrower job: run the
+`gh` CLI itself, with whatever arguments a caller sends, authenticated by
+the caller's own token rather than a server-side secret. Where `index.js`
+runs one operator-chosen command behind a shared password, `gh-proxy.js`
+runs any `gh` subcommand the caller asks for, scoped to whatever that
+caller's own credential can already do.
+
+Start it:
+
+```
+node gh-proxy.js
+```
+
+Call it:
+
+```
+curl -X POST localhost:3003/gh \
+  -H "Authorization: Bearer <a GitHub token>" \
+  -H "Content-Type: application/json" \
+  -d '{"command": "pr list --state open"}'
+```
+
+The server runs `GH_TOKEN="<that token>" gh <command>` and returns the
+result. `command` is split into arguments the way a shell would — quotes
+group a token, a backslash escapes a character — but no shell is ever
+invoked: the parsed arguments go straight to `gh` as a literal argument
+list. A `command` containing `;`, `&&`, `|`, `$(...)` or backticks does
+not chain a second command, because there is no shell there to interpret
+them; they just become (almost always invalid) arguments to `gh`.
+
+There is no separate access secret: the bearer token in the `Authorization`
+header IS `GH_TOKEN` for the call. A missing or invalid token fails exactly
+the way running `gh` locally with no `GH_TOKEN` set would — at the GitHub
+API, inside `gh` itself — so this process can only do what the presented
+token could already do.
+
+## Response
+
+- Success (`gh` exits 0): `200` with `{ ok: true, exit_code: 0, durationMs, stdout, stderr, truncated }`.
+- Failure (non-zero exit or killed by signal): `500` with `{ ok: false, exit_code, signal, durationMs, stdout, stderr }`. As with the webhook above, a signal kill (our own timeout, or `gh` crashing) reports `exit_code: null` with `signal` set, distinct from a real non-zero exit.
+- Missing or invalid `Authorization`: `401`, no body.
+- Missing/empty `command`, or a `command` with an unterminated quote: `400` with `{ ok: false, error: "<reason>" }`.
+- Request body larger than 64 KiB: `413` with `{ ok: false, error: "body too large" }`.
+- Wrong method: `405` with `Allow: POST`. Wrong path (anything but `/gh`): `404`.
+
+`stdout`/`stderr` are capped at `OUTPUT_MAX` (256 KiB each) with
+`truncated: true` if either was cut; `gh`'s own output (JSON listings,
+diffs) runs larger than a typical deploy command's, so this cap is well
+above the webhook's 2000-character tails. `COMMAND_TIMEOUT_MS` defaults to
+2 minutes — override with the `GH_PROXY_TIMEOUT_MS` env var for a call
+that legitimately needs longer.
+
+Unlike the webhook above, concurrent calls are not serialized: each
+request runs its own `gh` invocation with its own token, so there is no
+shared command for two in-flight requests to race against.
+
 # Running under pm2
 
-`ecosystem.config.js` at the repo root registers `index.js` with pm2 so
-the process is supervised, restarts on crash, and survives host reboots
-(if pm2's own systemd unit is installed via `pm2 startup`). Env values
-(`APP_NAME`, `COMMAND`, `SECRET`, `PORT`) are read from the shell at
-startup — no secrets in the repo.
+`ecosystem.config.js` at the repo root registers BOTH servers as
+separate pm2 apps — `webhook` (`index.js`) and `gh-proxy`
+(`gh-proxy.js`) — so each is supervised, restarts on crash, and
+survives host reboots (if pm2's own systemd unit is installed via
+`pm2 startup`). Env values are read from the shell at startup — no
+secrets in the repo.
 
-First-time start (or after `git pull` in an existing checkout):
+First-time start (or after `git pull` in an existing checkout) — starts
+both apps in one call:
 
 ```
 APP_NAME=<your name> \
   COMMAND='<your shell command>' \
   SECRET='<your secret>' \
   PORT=3002 \
+  GH_PROXY_PORT=3003 \
   pm2 startOrReload ecosystem.config.js
 ```
 
@@ -80,8 +141,14 @@ APP_NAME=<your name> \
   COMMAND='<your shell command>' \
   SECRET='<your secret>' \
   PORT=3002 \
+  GH_PROXY_PORT=3003 \
   pm2 restart ecosystem.config.js --update-env
 ```
+
+Only want one of the two apps? Add `--only webhook` or
+`--only gh-proxy` to either command above — pm2 reads the rest of
+`ecosystem.config.js` for context but starts/restarts just the named
+app, so you don't have to supply the other app's env vars at all.
 
 Notes:
 
@@ -89,9 +156,16 @@ Notes:
   needs a specific cwd (e.g. it references files by relative path), set
   the pm2 process's `cwd` in `ecosystem.config.js`, or prefix `COMMAND`
   with `cd /path/to/dir &&`.
-- `APP_NAME` names the pm2 process handle used by `pm2 restart` /
-  `pm2 logs`. Defaults to `webhook`. Give each instance a distinct
-  `APP_NAME` + `PORT` if you want to run several webhooks on one host.
+- `APP_NAME` names the webhook app's pm2 process handle (used by
+  `pm2 restart` / `pm2 logs`); `GH_PROXY_APP_NAME` is its gh-proxy
+  equivalent. Both default to their script's own name (`webhook`,
+  `gh-proxy`). Give each instance a distinct name + port if you want
+  to run several of either on one host.
+- `gh-proxy` takes no `COMMAND`/`SECRET` — only `GH_PROXY_PORT` (default
+  `3003`) and the optional `GH_PROXY_TIMEOUT_MS`. It uses a different
+  port env name on purpose, so starting both apps from one
+  `pm2 startOrReload` call can't collide them on a single shared `PORT`
+  value.
 
 Everyday commands:
 
