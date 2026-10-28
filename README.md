@@ -60,28 +60,31 @@ per stream, 10-minute timeout for `COMMAND`.
 `ecosystem.config.js` at the repo root registers `index.js` with pm2 so
 the process is supervised, restarts on crash, and survives host reboots
 (if pm2's own systemd unit is installed via `pm2 startup`). Env values
-(`APP_NAME`, `COMMAND`, `SECRET`, `PORT`) are read from the shell at
-startup — no secrets in the repo.
+(`APP_NAME`, `COMMAND`, `SECRET`, `PORT`) come from `.env`, which
+`ecosystem.config.js` loads itself — no secrets in the repo, and no
+need to prefix variables on the pm2 command line. A variable set in
+the shell wins over `.env`.
 
 First-time start (or after `git pull` in an existing checkout):
 
 ```
-APP_NAME=<your name> \
-  COMMAND='<your shell command>' \
-  SECRET='<your secret>' \
-  PORT=3002 \
-  pm2 startOrReload ecosystem.config.js
+cp .env.example .env
+# edit .env — set APP_NAME, COMMAND, SECRET, PORT
+
+pm2 startOrReload ecosystem.config.js
+pm2 save
 ```
 
-Restart in place, picking up new code AND new env:
+Restart in place, picking up new code AND new `.env` values:
 
 ```
-APP_NAME=<your name> \
-  COMMAND='<your shell command>' \
-  SECRET='<your secret>' \
-  PORT=3002 \
-  pm2 restart ecosystem.config.js --update-env
+pm2 restart ecosystem.config.js
 ```
+
+A restart that names the config file re-reads `.env`; a restart by
+process name does not, and neither does a reboot resurrect until the
+next config-file restart — run `pm2 save` after a config-file restart
+so the current list persists.
 
 Notes:
 
@@ -92,6 +95,9 @@ Notes:
 - `APP_NAME` names the pm2 process handle used by `pm2 restart` /
   `pm2 logs`. Defaults to `webhook`. Give each instance a distinct
   `APP_NAME` + `PORT` if you want to run several webhooks on one host.
+  Changing `APP_NAME` in `.env` and restarting via the config file
+  starts a second process under the new name — the old one keeps
+  running. Delete the old one (`pm2 delete <old-name>`) when renaming.
 
 Everyday commands:
 
@@ -104,6 +110,7 @@ pm2 delete <APP_NAME>          # remove from the process list
 pm2 save                       # persist the current list so `pm2 resurrect` re-hydrates it after reboot
 ```
 
-Use `pm2 restart <name> --update-env` when the env changed (rotated
-secret, new `COMMAND`); a plain `pm2 restart <name>` reuses the env
-pm2 recorded at `startOrReload` time.
+Use `pm2 restart <name> --update-env` when a variable changed in the
+shell (rotated secret exported there, new `COMMAND`); it updates the
+env from the invoking shell, not from `.env`. A plain `pm2 restart
+<name>` reuses the env pm2 recorded at `startOrReload` time.
